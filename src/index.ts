@@ -490,6 +490,83 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "relay_create_room",
+      description: [
+        "Create a chat room with optional per-agent access control.",
+        "Rooms auto-create with open permissions when first used, but this tool lets you set ACLs.",
+        "Permissions: read (receive messages), write (send messages), history (access chat history).",
+      ].join(" "),
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          room_id: {
+            type: "string",
+            description: "Room identifier — lowercase alphanumeric and dashes, e.g. 'ops', 'research-team'",
+          },
+          name: {
+            type: "string",
+            description: "Human-readable room name (defaults to room_id)",
+          },
+          default_permission: {
+            type: "object",
+            description: "Default permissions for agents not in the ACL (defaults to all true)",
+            properties: {
+              read: { type: "boolean" },
+              write: { type: "boolean" },
+              history: { type: "boolean" },
+            },
+          },
+          acl: {
+            type: "array",
+            description: "Per-agent permission overrides",
+            items: {
+              type: "object",
+              properties: {
+                agent_id: { type: "string" },
+                read: { type: "boolean" },
+                write: { type: "boolean" },
+                history: { type: "boolean" },
+              },
+              required: ["agent_id"],
+            },
+          },
+        },
+        required: ["room_id"],
+      },
+    },
+    {
+      name: "relay_list_rooms",
+      description: "List all chat rooms with their access control settings.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "relay_set_room_permission",
+      description: [
+        "Set or update permissions for a specific agent in a room.",
+        "Permissions: read (receive messages), write (send), history (access chat history).",
+      ].join(" "),
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          room_id: {
+            type: "string",
+            description: "The room to modify",
+          },
+          agent_id: {
+            type: "string",
+            description: "The agent to set permissions for",
+          },
+          read: { type: "boolean", description: "Can receive messages (default: true)" },
+          write: { type: "boolean", description: "Can send messages (default: true)" },
+          history: { type: "boolean", description: "Can access chat history (default: true)" },
+        },
+        required: ["room_id", "agent_id"],
+      },
+    },
   ],
 }));
 
@@ -756,6 +833,93 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: `Error connecting to relay. ${err instanceof Error ? err.message : String(err)}`,
           },
         ],
+        isError: true,
+      };
+    }
+  }
+
+  // ── relay_create_room: POST to HTTP endpoint ──
+  if (name === "relay_create_room") {
+    const { room_id, name: roomName, default_permission, acl } = args as {
+      room_id: string;
+      name?: string;
+      default_permission?: { read: boolean; write: boolean; history: boolean };
+      acl?: Array<{ agent_id: string; read?: boolean; write?: boolean; history?: boolean }>;
+    };
+    try {
+      const res = await fetch(`${RELAY_URL}/rooms`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          id: room_id,
+          name: roomName,
+          created_by: SESSION_NAME,
+          default_permission,
+          acl,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return {
+          content: [{ type: "text", text: `Error: ${(data as any).error || res.statusText}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Room created:\n${JSON.stringify(data, null, 2)}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  }
+
+  // ── relay_list_rooms: GET from HTTP endpoint ──
+  if (name === "relay_list_rooms") {
+    try {
+      const res = await fetch(`${RELAY_URL}/rooms`, { headers: authHeaders() });
+      const data = await res.json();
+      return {
+        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  }
+
+  // ── relay_set_room_permission: PUT to HTTP endpoint ──
+  if (name === "relay_set_room_permission") {
+    const { room_id, agent_id, read, write, history } = args as {
+      room_id: string;
+      agent_id: string;
+      read?: boolean;
+      write?: boolean;
+      history?: boolean;
+    };
+    try {
+      const res = await fetch(`${RELAY_URL}/rooms/${encodeURIComponent(room_id)}/acl`, {
+        method: "PUT",
+        headers: authHeaders(),
+        body: JSON.stringify({ agent_id, read, write, history }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return {
+          content: [{ type: "text", text: `Error: ${(data as any).error || res.statusText}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Permission updated:\n${JSON.stringify(data, null, 2)}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       };
     }
