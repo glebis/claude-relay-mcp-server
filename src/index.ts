@@ -1373,6 +1373,52 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  // DELETE /rooms/:id — delete a room
+  const roomDeleteMatch = url.pathname.match(/^\/rooms\/([\w-]+)$/);
+  if (req.method === "DELETE" && roomDeleteMatch) {
+    const roomId = roomDeleteMatch[1];
+    if (roomId === "general") {
+      jsonResponse(res, 400, { error: "Cannot delete the general room" });
+      return;
+    }
+    const deleted = roomRegistry.delete(roomId);
+    if (!deleted) {
+      jsonResponse(res, 404, { error: `Room "${roomId}" not found` });
+      return;
+    }
+    jsonResponse(res, 200, { ok: true, deleted: roomId });
+    return;
+  }
+
+  // PUT /rooms/:id/default — update default permission for a room
+  const roomDefaultMatch = url.pathname.match(/^\/rooms\/([\w-]+)\/default$/);
+  if (req.method === "PUT" && roomDefaultMatch) {
+    try {
+      const roomId = roomDefaultMatch[1];
+      const room = roomRegistry.get(roomId);
+      if (!room) {
+        jsonResponse(res, 404, { error: `Room "${roomId}" not found` });
+        return;
+      }
+      const body = await readBody(req);
+      const { read, write, history } = JSON.parse(body) as {
+        read?: boolean;
+        write?: boolean;
+        history?: boolean;
+      };
+      roomRegistry.setDefaultPermission(roomId, {
+        read: read ?? false,
+        write: write ?? false,
+        history: history ?? false,
+      });
+      jsonResponse(res, 200, roomRegistry.serialize(room));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      jsonResponse(res, 500, { error: msg });
+    }
+    return;
+  }
+
   jsonResponse(res, 404, { error: "Not found" });
 });
 

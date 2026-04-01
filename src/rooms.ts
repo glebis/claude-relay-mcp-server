@@ -92,6 +92,16 @@ export class RoomRegistry {
     room.acl.delete(agentId);
   }
 
+  setDefaultPermission(roomId: string, permission: Permission): void {
+    const room = this.rooms.get(roomId);
+    if (!room) throw new Error(`Room "${roomId}" not found`);
+    room.defaultPermission = permission;
+  }
+
+  delete(roomId: string): boolean {
+    return this.rooms.delete(roomId);
+  }
+
   private resolve(roomId: string, agentId: string): Permission {
     const room = this.rooms.get(roomId);
     if (!room) return OPEN_PERMISSION; // unknown room = open (backward compat)
