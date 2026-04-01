@@ -16,6 +16,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { RoomRegistry, extractMentions, OPEN_PERMISSION } from "./rooms.js";
 
 // ── Configuration ──────────────────────────────────────────────────
 
@@ -27,6 +28,9 @@ const SESSION_NAME = process.env.RELAY_SESSION_NAME || `session-${randomBytes(3)
 const TASK_TTL_MS = parseInt(process.env.RELAY_TASK_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MACHINE_HEARTBEAT_MS = 30 * 1000; // 30 seconds stale threshold
+
+const roomRegistry = new RoomRegistry();
+roomRegistry.ensureRoom("general"); // backward compat: always have a "general" room
 
 // ── Task Store ─────────────────────────────────────────────────────
 
@@ -60,19 +64,23 @@ interface ChatMessage {
   message: string;
   room: string;
   replyTo?: string; // id of message being replied to
+  mentions: string[]; // @mentioned agent names (without @, lowercased)
   createdAt: number;
 }
 
 const chatMessages: ChatMessage[] = [];
 const MAX_CHAT_HISTORY = 200;
 
-function addChatMessage(from: string, message: string, room: string, replyTo?: string): ChatMessage {
+function addChatMessage(from: string, message: string, room: string, replyTo?: string): ChatMessage | null {
+  roomRegistry.ensureRoom(room);
+  if (!roomRegistry.canWrite(room, from)) return null;
   const msg: ChatMessage = {
     id: generateId(),
     from,
     message,
     room,
     replyTo,
+    mentions: extractMentions(message),
     createdAt: Date.now(),
   };
   chatMessages.push(msg);
@@ -124,6 +132,8 @@ function broadcastSSE(taskId: string, message: string, sender?: string, to?: str
   for (const sub of sseSubscribers) {
     // If "to" is specified, only send to that subscriber; otherwise broadcast to all
     if (to && sub.senderId && sub.senderId !== to) continue;
+    // Never echo back to sender (self-dedup)
+    if (sender && sub.senderId && sub.senderId === sender) continue;
     try {
       sub.res.write(`data: ${data}\n\n`);
     } catch {
@@ -134,9 +144,20 @@ function broadcastSSE(taskId: string, message: string, sender?: string, to?: str
 
 function broadcastChat(msg: ChatMessage): void {
   const data = JSON.stringify({ type: "chat", ...msg });
+  const hasMentions = msg.mentions.length > 0;
   for (const sub of sseSubscribers) {
-    // Don't echo back to sender
-    if (sub.senderId === msg.from) continue;
+    // Self-dedup: never echo back to sender
+    if (sub.senderId && sub.senderId === msg.from) continue;
+    // Anonymous subscribers: deliver for open rooms, skip ACL-protected
+    if (!sub.senderId) {
+      const roomObj = roomRegistry.get(msg.room);
+      if (roomObj && roomObj.acl.size > 0) continue;
+    } else {
+      // ACL: only deliver to agents with read permission
+      if (!roomRegistry.canRead(msg.room, sub.senderId)) continue;
+      // @mention filter: if mentions exist, only deliver to mentioned agents
+      if (hasMentions && !msg.mentions.includes(sub.senderId.toLowerCase())) continue;
+    }
     try {
       sub.res.write(`data: ${data}\n\n`);
     } catch {
@@ -469,6 +490,83 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "relay_create_room",
+      description: [
+        "Create a chat room with optional per-agent access control.",
+        "Rooms auto-create with open permissions when first used, but this tool lets you set ACLs.",
+        "Permissions: read (receive messages), write (send messages), history (access chat history).",
+      ].join(" "),
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          room_id: {
+            type: "string",
+            description: "Room identifier — lowercase alphanumeric and dashes, e.g. 'ops', 'research-team'",
+          },
+          name: {
+            type: "string",
+            description: "Human-readable room name (defaults to room_id)",
+          },
+          default_permission: {
+            type: "object",
+            description: "Default permissions for agents not in the ACL (defaults to all true)",
+            properties: {
+              read: { type: "boolean" },
+              write: { type: "boolean" },
+              history: { type: "boolean" },
+            },
+          },
+          acl: {
+            type: "array",
+            description: "Per-agent permission overrides",
+            items: {
+              type: "object",
+              properties: {
+                agent_id: { type: "string" },
+                read: { type: "boolean" },
+                write: { type: "boolean" },
+                history: { type: "boolean" },
+              },
+              required: ["agent_id"],
+            },
+          },
+        },
+        required: ["room_id"],
+      },
+    },
+    {
+      name: "relay_list_rooms",
+      description: "List all chat rooms with their access control settings.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "relay_set_room_permission",
+      description: [
+        "Set or update permissions for a specific agent in a room.",
+        "Permissions: read (receive messages), write (send), history (access chat history).",
+      ].join(" "),
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          room_id: {
+            type: "string",
+            description: "The room to modify",
+          },
+          agent_id: {
+            type: "string",
+            description: "The agent to set permissions for",
+          },
+          read: { type: "boolean", description: "Can receive messages (default: true)" },
+          write: { type: "boolean", description: "Can send messages (default: true)" },
+          history: { type: "boolean", description: "Can access chat history (default: true)" },
+        },
+        required: ["room_id", "agent_id"],
+      },
+    },
   ],
 }));
 
@@ -718,6 +816,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const params = new URLSearchParams({
         room: room || "general",
         limit: String(limit || 50),
+        agent: SESSION_NAME,
       });
       const res = await fetch(`${RELAY_URL}/chat?${params}`, {
         headers: authHeaders(),
@@ -734,6 +833,93 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: `Error connecting to relay. ${err instanceof Error ? err.message : String(err)}`,
           },
         ],
+        isError: true,
+      };
+    }
+  }
+
+  // ── relay_create_room: POST to HTTP endpoint ──
+  if (name === "relay_create_room") {
+    const { room_id, name: roomName, default_permission, acl } = args as {
+      room_id: string;
+      name?: string;
+      default_permission?: { read: boolean; write: boolean; history: boolean };
+      acl?: Array<{ agent_id: string; read?: boolean; write?: boolean; history?: boolean }>;
+    };
+    try {
+      const res = await fetch(`${RELAY_URL}/rooms`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          id: room_id,
+          name: roomName,
+          created_by: SESSION_NAME,
+          default_permission,
+          acl,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return {
+          content: [{ type: "text", text: `Error: ${(data as any).error || res.statusText}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Room created:\n${JSON.stringify(data, null, 2)}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  }
+
+  // ── relay_list_rooms: GET from HTTP endpoint ──
+  if (name === "relay_list_rooms") {
+    try {
+      const res = await fetch(`${RELAY_URL}/rooms`, { headers: authHeaders() });
+      const data = await res.json();
+      return {
+        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  }
+
+  // ── relay_set_room_permission: PUT to HTTP endpoint ──
+  if (name === "relay_set_room_permission") {
+    const { room_id, agent_id, read, write, history } = args as {
+      room_id: string;
+      agent_id: string;
+      read?: boolean;
+      write?: boolean;
+      history?: boolean;
+    };
+    try {
+      const res = await fetch(`${RELAY_URL}/rooms/${encodeURIComponent(room_id)}/acl`, {
+        method: "PUT",
+        headers: authHeaders(),
+        body: JSON.stringify({ agent_id, read, write, history }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return {
+          content: [{ type: "text", text: `Error: ${(data as any).error || res.statusText}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Permission updated:\n${JSON.stringify(data, null, 2)}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       };
     }
@@ -782,10 +968,11 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/") {
     jsonResponse(res, 200, {
       name: "claude-relay",
-      version: "2.0.0",
+      version: "2.1.0",
       session_name: SESSION_NAME,
       tasks_count: tasks.size,
       sse_subscribers: sseSubscribers.size,
+      rooms_count: roomRegistry.list().length,
       auth_required: !!RELAY_TOKEN,
     });
     return;
@@ -1025,8 +1212,17 @@ const httpServer = createServer(async (req, res) => {
       const chatRoom = room || "general";
       const msg = addChatMessage(from, message, chatRoom, reply_to);
 
+      if (!msg) {
+        jsonResponse(res, 403, { error: `Agent "${from}" does not have write access to room "${chatRoom}"` });
+        return;
+      }
+
       // Push to local Claude Code session (if not from self)
-      if (from !== SESSION_NAME) {
+      // Also check ACL + mention filter for local host delivery
+      const hostCanRead = roomRegistry.canRead(chatRoom, SESSION_NAME);
+      const hasMentions = msg.mentions.length > 0;
+      const hostMentioned = !hasMentions || msg.mentions.includes(SESSION_NAME.toLowerCase());
+      if (from !== SESSION_NAME && hostCanRead && hostMentioned) {
         const replyContext = reply_to ? ` (replying to ${reply_to})` : "";
         await server.notification({
           method: "notifications/claude/channel",
@@ -1062,6 +1258,19 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/chat") {
     const room = url.searchParams.get("room") || "general";
     const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+    const agent = url.searchParams.get("agent");
+    // If room has ACL entries, require agent param for history access
+    const roomObj = roomRegistry.get(room);
+    if (roomObj && roomObj.acl.size > 0) {
+      if (!agent) {
+        jsonResponse(res, 400, { error: `Room "${room}" has ACL — "agent" query param is required for history access` });
+        return;
+      }
+      if (!roomRegistry.canAccessHistory(room, agent)) {
+        jsonResponse(res, 403, { error: `Agent "${agent}" does not have history access to room "${room}"` });
+        return;
+      }
+    }
     jsonResponse(res, 200, { room, messages: getChatHistory(room, limit) });
     return;
   }
@@ -1158,7 +1367,11 @@ const httpServer = createServer(async (req, res) => {
       timestamp: t.createdAt,
     }));
     const all = [...allChats, ...allTasks].sort((a, b) => a.timestamp - b.timestamp);
-    jsonResponse(res, 200, { events: all, machines: getMachineList() });
+    jsonResponse(res, 200, {
+      events: all,
+      machines: getMachineList(),
+      rooms: roomRegistry.list().map((r) => roomRegistry.serialize(r)),
+    });
     return;
   }
 
@@ -1172,6 +1385,95 @@ const httpServer = createServer(async (req, res) => {
       jsonResponse(res, 200, { ok: true });
     } catch {
       jsonResponse(res, 400, { error: "Invalid heartbeat payload" });
+    }
+    return;
+  }
+
+  // GET /rooms — list all rooms with ACL
+  if (req.method === "GET" && url.pathname === "/rooms") {
+    jsonResponse(res, 200, {
+      rooms: roomRegistry.list().map((r) => roomRegistry.serialize(r)),
+    });
+    return;
+  }
+
+  // POST /rooms — create a room with optional ACL
+  if (req.method === "POST" && url.pathname === "/rooms") {
+    try {
+      const body = await readBody(req);
+      const config = JSON.parse(body) as {
+        id: string;
+        name?: string;
+        created_by?: string;
+        default_permission?: { read: boolean; write: boolean; history: boolean };
+        acl?: Array<{ agent_id: string; read?: boolean; write?: boolean; history?: boolean }>;
+      };
+
+      if (!config.id) {
+        jsonResponse(res, 400, { error: "Room ID is required" });
+        return;
+      }
+
+      // Validate ACL entries have agent_id
+      if (config.acl?.some((a) => !a.agent_id)) {
+        jsonResponse(res, 400, { error: "Each ACL entry must have an agent_id" });
+        return;
+      }
+
+      const room = roomRegistry.create({
+        id: config.id,
+        name: config.name || config.id,
+        createdBy: config.created_by,
+        defaultPermission: config.default_permission,
+        acl: config.acl?.map((a) => ({
+          agentId: a.agent_id,
+          permission: {
+            read: a.read ?? true,
+            write: a.write ?? true,
+            history: a.history ?? true,
+          },
+        })),
+      });
+
+      jsonResponse(res, 201, roomRegistry.serialize(room));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const status = msg.includes("already exists") || msg.includes("Invalid") ? 400 : 500;
+      jsonResponse(res, status, { error: msg });
+    }
+    return;
+  }
+
+  // PUT /rooms/:id/acl — set per-agent permission
+  const roomAclMatch = url.pathname.match(/^\/rooms\/([\w-]+)\/acl$/);
+  if (req.method === "PUT" && roomAclMatch) {
+    try {
+      const roomId = roomAclMatch[1];
+      const room = roomRegistry.get(roomId);
+      if (!room) {
+        jsonResponse(res, 404, { error: `Room "${roomId}" not found` });
+        return;
+      }
+      const body = await readBody(req);
+      const { agent_id, read, write, history } = JSON.parse(body) as {
+        agent_id: string;
+        read?: boolean;
+        write?: boolean;
+        history?: boolean;
+      };
+      if (!agent_id) {
+        jsonResponse(res, 400, { error: "agent_id is required" });
+        return;
+      }
+      roomRegistry.setAgentPermission(roomId, agent_id, {
+        read: read ?? true,
+        write: write ?? true,
+        history: history ?? true,
+      });
+      jsonResponse(res, 200, roomRegistry.serialize(room));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      jsonResponse(res, 500, { error: msg });
     }
     return;
   }
