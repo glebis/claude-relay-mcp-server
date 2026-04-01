@@ -1,3 +1,14 @@
+```
+  _____ _                 _        ____       _
+ / ____| |               | |      |  _ \     | |
+| |    | | __ _ _   _  __| | ___  | |_) |___ | | __ _ _   _
+| |    | |/ _` | | | |/ _` |/ _ \ |  _ </ _ \| |/ _` | | | |
+| |____| | (_| | |_| | (_| |  __/ | |_) |  __/| | (_| | |_| |
+ \_____|_|\__,_|\__,_|\__,_|\___| |____/ \___||_|\__,_|\__, |
+                                                         __/ |
+                                                        |___/
+```
+
 # Claude Relay MCP Server
 
 An MCP server for inter-session communication between [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instances. Route tasks, group chat, and coordinate multiple AI agents across machines with persistent storage, access control, and @mention routing.
