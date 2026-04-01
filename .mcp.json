@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "claude-relay": {
+      "command": "node",
+      "args": ["/Users/glebkalinin/ai_projects/claude-relay-mcp-server/dist/index.js"]
+    }
+  }
+}

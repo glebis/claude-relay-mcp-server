@@ -1,0 +1,96 @@
+<h2>Three Approaches for HITL Relay v2</h2>
+<p class="subtitle">Pick the architecture that fits best. Each builds on the current relay differently.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Embedded — Everything in the Relay</h3>
+      <p>Add SQLite, review UI, LLM-as-judge, and evaluation all inside <code>src/index.ts</code>. Single process, single deploy.</p>
+      <div class="pros-cons">
+        <div class="pros">
+          <h4>Pros</h4>
+          <ul>
+            <li>Simplest deploy — one process, one file (grows to ~3000 lines)</li>
+            <li>Zero latency between relay events and evaluation</li>
+            <li>No new dependencies beyond better-sqlite3</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>Cons</h4>
+          <ul>
+            <li>Monolith grows unwieldy — relay + eval + UI + LLM judge all coupled</li>
+            <li>LLM-as-judge calls block the event loop (unless worker thread)</li>
+            <li>Hard to test evaluation logic independently</li>
+          </ul>
+        </div>
+      </div>
+      <p><strong>Effort:</strong> ~2 weeks. <strong>Risk:</strong> Architect demon territory — one big file doing everything.</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Modular Monolith — Split Domains, Single Process</h3>
+      <p>Break into domain modules (<code>src/relay/</code>, <code>src/eval/</code>, <code>src/ui/</code>, <code>src/store/</code>) sharing one SQLite database. Still one <code>npm start</code>.</p>
+      <div class="pros-cons">
+        <div class="pros">
+          <h4>Pros</h4>
+          <ul>
+            <li>Clean domain boundaries (DDD) — relay, evaluation, storage, UI are separate</li>
+            <li>Each module testable independently</li>
+            <li>Single deploy, single process — same ops simplicity as A</li>
+            <li>LLM-as-judge runs in eval module with its own retry logic</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>Cons</h4>
+          <ul>
+            <li>Needs upfront file reorganization (~1 day)</li>
+            <li>Shared SQLite means modules are still coupled at the data layer</li>
+          </ul>
+        </div>
+      </div>
+      <p><strong>Effort:</strong> ~2.5 weeks. <strong>Risk:</strong> Low — standard Node.js project structure.</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Sidecar — Relay + Eval as Separate Services</h3>
+      <p>Keep relay lean (messaging only). Evaluation service runs alongside, subscribes to relay events via SSE (<code>/observe</code>), stores to its own SQLite, serves its own review UI.</p>
+      <div class="pros-cons">
+        <div class="pros">
+          <h4>Pros</h4>
+          <ul>
+            <li>Relay stays focused and lightweight — publishable as a clean OSS tool</li>
+            <li>Eval service can be swapped, upgraded, or disabled independently</li>
+            <li>Different teams/labs can run different eval configs</li>
+            <li>Eval service failure doesn't affect message delivery</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>Cons</h4>
+          <ul>
+            <li>Two processes to manage (needs launchd/pm2)</li>
+            <li>Network hop between relay and eval (minimal on localhost)</li>
+            <li>More complex setup for new users</li>
+          </ul>
+        </div>
+      </div>
+      <p><strong>Effort:</strong> ~3 weeks. <strong>Risk:</strong> Over-engineering if eval is only used by you.</p>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 2rem; padding: 1.5rem; background: #1a1a2e; border-radius: 12px; border: 1px solid #333;">
+  <h3>⭐ Recommendation: B — Modular Monolith</h3>
+  <p style="color: #aaa; line-height: 1.6;">
+    B gives you clean DDD boundaries without ops overhead. The relay repo becomes a well-structured project with clear modules that lab participants can understand. You ship one <code>npm start</code>, not two services. If you later want to extract eval into a sidecar (approach C), the module boundaries make that a clean cut.
+  </p>
+  <p style="color: #aaa; line-height: 1.6;">
+    A is the architect demon. C is premature for 2-5 users.
+  </p>
+</div>
