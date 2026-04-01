@@ -131,10 +131,10 @@ function broadcastToObservers(event: {
 function broadcastSSE(taskId: string, message: string, sender?: string, to?: string): void {
   const data = JSON.stringify({ task_id: taskId, message, sender, to });
   for (const sub of sseSubscribers) {
+    // Don't echo back to sender
+    if (sender && sub.senderId === sender) continue;
     // If "to" is specified, only send to that subscriber; otherwise broadcast to all
     if (to && sub.senderId && sub.senderId !== to) continue;
-    // Never echo back to sender (self-dedup)
-    if (sender && sub.senderId && sub.senderId === sender) continue;
     try {
       sub.res.write(`data: ${data}\n\n`);
     } catch {
@@ -1488,6 +1488,15 @@ const httpServer = createServer(async (req, res) => {
 // ── Startup ────────────────────────────────────────────────────────
 
 // ── SSE Client (for client-only mode) ─────────────────────────────
+
+let sseReconnectAttempt = 0;
+
+function backoffDelay(attempt: number): number {
+  const base = 1000;
+  const max = 30000;
+  const jitter = 0.5 + Math.random() * 0.5;
+  return Math.min(max, base * Math.pow(2, attempt) * jitter);
+}
 
 function subscribeToSSE(): void {
   const sseUrl = `${RELAY_URL}/subscribe?sender=${SESSION_NAME}&version=${RELAY_VERSION}`;
