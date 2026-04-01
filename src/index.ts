@@ -1220,6 +1220,95 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  // GET /rooms — list all rooms with ACL
+  if (req.method === "GET" && url.pathname === "/rooms") {
+    jsonResponse(res, 200, {
+      rooms: roomRegistry.list().map((r) => roomRegistry.serialize(r)),
+    });
+    return;
+  }
+
+  // POST /rooms — create a room with optional ACL
+  if (req.method === "POST" && url.pathname === "/rooms") {
+    try {
+      const body = await readBody(req);
+      const config = JSON.parse(body) as {
+        id: string;
+        name?: string;
+        created_by?: string;
+        default_permission?: { read: boolean; write: boolean; history: boolean };
+        acl?: Array<{ agent_id: string; read?: boolean; write?: boolean; history?: boolean }>;
+      };
+
+      if (!config.id) {
+        jsonResponse(res, 400, { error: "Room ID is required" });
+        return;
+      }
+
+      // Validate ACL entries have agent_id
+      if (config.acl?.some((a) => !a.agent_id)) {
+        jsonResponse(res, 400, { error: "Each ACL entry must have an agent_id" });
+        return;
+      }
+
+      const room = roomRegistry.create({
+        id: config.id,
+        name: config.name || config.id,
+        createdBy: config.created_by,
+        defaultPermission: config.default_permission,
+        acl: config.acl?.map((a) => ({
+          agentId: a.agent_id,
+          permission: {
+            read: a.read ?? true,
+            write: a.write ?? true,
+            history: a.history ?? true,
+          },
+        })),
+      });
+
+      jsonResponse(res, 201, roomRegistry.serialize(room));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const status = msg.includes("already exists") || msg.includes("Invalid") ? 400 : 500;
+      jsonResponse(res, status, { error: msg });
+    }
+    return;
+  }
+
+  // PUT /rooms/:id/acl — set per-agent permission
+  const roomAclMatch = url.pathname.match(/^\/rooms\/([\w-]+)\/acl$/);
+  if (req.method === "PUT" && roomAclMatch) {
+    try {
+      const roomId = roomAclMatch[1];
+      const room = roomRegistry.get(roomId);
+      if (!room) {
+        jsonResponse(res, 404, { error: `Room "${roomId}" not found` });
+        return;
+      }
+      const body = await readBody(req);
+      const { agent_id, read, write, history } = JSON.parse(body) as {
+        agent_id: string;
+        read?: boolean;
+        write?: boolean;
+        history?: boolean;
+      };
+      if (!agent_id) {
+        jsonResponse(res, 400, { error: "agent_id is required" });
+        return;
+      }
+      roomRegistry.setAgentPermission(roomId, agent_id, {
+        read: read ?? true,
+        write: write ?? true,
+        history: history ?? true,
+      });
+      jsonResponse(res, 200, roomRegistry.serialize(room));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      jsonResponse(res, 500, { error: msg });
+    }
+    return;
+  }
+
   jsonResponse(res, 404, { error: "Not found" });
 });
 
