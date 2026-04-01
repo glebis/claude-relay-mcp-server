@@ -124,6 +124,8 @@ function broadcastSSE(taskId: string, message: string, sender?: string, to?: str
   for (const sub of sseSubscribers) {
     // If "to" is specified, only send to that subscriber; otherwise broadcast to all
     if (to && sub.senderId && sub.senderId !== to) continue;
+    // Never echo back to sender (self-dedup)
+    if (sender && sub.senderId && sub.senderId === sender) continue;
     try {
       sub.res.write(`data: ${data}\n\n`);
     } catch {
