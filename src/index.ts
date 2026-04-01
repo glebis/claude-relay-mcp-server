@@ -1508,11 +1508,12 @@ function subscribeToSSE(): void {
   fetch(sseUrl, { headers: sseHeaders }).then(async (res) => {
     if (!res.ok || !res.body) {
       console.error(`claude-relay: SSE connection failed (${res.status})`);
-      setTimeout(subscribeToSSE, 5000); // retry
+      setTimeout(subscribeToSSE, backoffDelay(sseReconnectAttempt++)); // retry
       return;
     }
 
     const reader = res.body.getReader();
+    sseReconnectAttempt = 0; // reset on successful connection
     const decoder = new TextDecoder();
     let buffer = "";
 
@@ -1578,10 +1579,10 @@ function subscribeToSSE(): void {
 
     // Stream ended — reconnect
     console.error("claude-relay: SSE stream ended, reconnecting...");
-    setTimeout(subscribeToSSE, 2000);
+    setTimeout(subscribeToSSE, backoffDelay(sseReconnectAttempt++));
   }).catch((err) => {
     console.error(`claude-relay: SSE connection error: ${err instanceof Error ? err.message : String(err)}`);
-    setTimeout(subscribeToSSE, 5000);
+    setTimeout(subscribeToSSE, backoffDelay(sseReconnectAttempt++));
   });
 }
 
