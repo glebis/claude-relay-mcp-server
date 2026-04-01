@@ -28,6 +28,7 @@ const SESSION_NAME = process.env.RELAY_SESSION_NAME || `session-${randomBytes(3)
 const TASK_TTL_MS = parseInt(process.env.RELAY_TASK_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MACHINE_HEARTBEAT_MS = 30 * 1000; // 30 seconds stale threshold
+const RELAY_VERSION = "2.1.0";
 
 const roomRegistry = new RoomRegistry();
 roomRegistry.ensureRoom("general"); // backward compat: always have a "general" room
@@ -212,12 +213,14 @@ interface Machine {
   lastSeen: number;
   mode: "host" | "client";
   ip?: string;
+  version?: string;
 }
 
 const machines = new Map<string, Machine>();
 
-function registerMachine(name: string, mode: "host" | "client", ip?: string): void {
-  machines.set(name, { name, lastSeen: Date.now(), mode, ip });
+function registerMachine(name: string, mode: "host" | "client", ip?: string, version?: string): void {
+  const existing = machines.get(name);
+  machines.set(name, { name, lastSeen: Date.now(), mode, ip, version: version || existing?.version });
 }
 
 function getMachineList(): Array<Machine & { online: boolean }> {
@@ -968,7 +971,7 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/") {
     jsonResponse(res, 200, {
       name: "claude-relay",
-      version: "2.1.0",
+      version: RELAY_VERSION,
       session_name: SESSION_NAME,
       tasks_count: tasks.size,
       sse_subscribers: sseSubscribers.size,
@@ -1153,6 +1156,7 @@ const httpServer = createServer(async (req, res) => {
   // GET /subscribe — SSE stream for client-only sessions
   if (req.method === "GET" && url.pathname === "/subscribe") {
     const senderId = url.searchParams.get("sender") || undefined;
+    const clientVersion = url.searchParams.get("version") || undefined;
     const clientIp = req.socket.remoteAddress;
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -1162,7 +1166,7 @@ const httpServer = createServer(async (req, res) => {
     res.write(":ok\n\n");
 
     if (senderId) {
-      registerMachine(senderId, "client", clientIp);
+      registerMachine(senderId, "client", clientIp, clientVersion);
     }
 
     const subscriber: SSESubscriber = { res, senderId };
@@ -1379,9 +1383,9 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/machines/heartbeat") {
     try {
       const body = await readBody(req);
-      const { name } = JSON.parse(body) as { name: string };
+      const { name, version } = JSON.parse(body) as { name: string; version?: string };
       const clientIp = req.socket.remoteAddress;
-      registerMachine(name, "client", clientIp);
+      registerMachine(name, "client", clientIp, version);
       jsonResponse(res, 200, { ok: true });
     } catch {
       jsonResponse(res, 400, { error: "Invalid heartbeat payload" });
@@ -1486,7 +1490,7 @@ const httpServer = createServer(async (req, res) => {
 // ── SSE Client (for client-only mode) ─────────────────────────────
 
 function subscribeToSSE(): void {
-  const sseUrl = `${RELAY_URL}/subscribe?sender=${SESSION_NAME}`;
+  const sseUrl = `${RELAY_URL}/subscribe?sender=${SESSION_NAME}&version=${RELAY_VERSION}`;
   console.error(`claude-relay: subscribing to SSE at ${sseUrl}`);
 
   const sseHeaders: Record<string, string> = {};
@@ -1596,7 +1600,7 @@ async function main(): Promise<void> {
         console.error("claude-relay: token auth DISABLED (set RELAY_TOKEN to enable)");
       }
       isHost = true;
-      registerMachine(SESSION_NAME, "host", RELAY_BIND);
+      registerMachine(SESSION_NAME, "host", RELAY_BIND, RELAY_VERSION);
       resolve();
     });
   });
