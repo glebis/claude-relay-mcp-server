@@ -968,10 +968,11 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/") {
     jsonResponse(res, 200, {
       name: "claude-relay",
-      version: "2.0.0",
+      version: "2.1.0",
       session_name: SESSION_NAME,
       tasks_count: tasks.size,
       sse_subscribers: sseSubscribers.size,
+      rooms_count: roomRegistry.list().length,
       auth_required: !!RELAY_TOKEN,
     });
     return;
@@ -1366,7 +1367,11 @@ const httpServer = createServer(async (req, res) => {
       timestamp: t.createdAt,
     }));
     const all = [...allChats, ...allTasks].sort((a, b) => a.timestamp - b.timestamp);
-    jsonResponse(res, 200, { events: all, machines: getMachineList() });
+    jsonResponse(res, 200, {
+      events: all,
+      machines: getMachineList(),
+      rooms: roomRegistry.list().map((r) => roomRegistry.serialize(r)),
+    });
     return;
   }
 
