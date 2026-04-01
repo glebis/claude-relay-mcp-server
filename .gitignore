@@ -1,4 +1,10 @@
 node_modules/
 dist/
-.worktrees/
+*.db
+*.db-wal
+*.db-shm
+.env
+.enzyme/
 .superpowers/
+.mcp.json
+.serendipity_cache.pkl
