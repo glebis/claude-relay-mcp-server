@@ -16,6 +16,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { RoomRegistry, extractMentions, OPEN_PERMISSION } from "./rooms.js";
 
 // ── Configuration ──────────────────────────────────────────────────
 
@@ -27,6 +28,9 @@ const SESSION_NAME = process.env.RELAY_SESSION_NAME || `session-${randomBytes(3)
 const TASK_TTL_MS = parseInt(process.env.RELAY_TASK_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MACHINE_HEARTBEAT_MS = 30 * 1000; // 30 seconds stale threshold
+
+const roomRegistry = new RoomRegistry();
+roomRegistry.ensureRoom("general"); // backward compat: always have a "general" room
 
 // ── Task Store ─────────────────────────────────────────────────────
 
@@ -60,19 +64,23 @@ interface ChatMessage {
   message: string;
   room: string;
   replyTo?: string; // id of message being replied to
+  mentions: string[]; // @mentioned agent names (without @, lowercased)
   createdAt: number;
 }
 
 const chatMessages: ChatMessage[] = [];
 const MAX_CHAT_HISTORY = 200;
 
-function addChatMessage(from: string, message: string, room: string, replyTo?: string): ChatMessage {
+function addChatMessage(from: string, message: string, room: string, replyTo?: string): ChatMessage | null {
+  roomRegistry.ensureRoom(room);
+  if (!roomRegistry.canWrite(room, from)) return null;
   const msg: ChatMessage = {
     id: generateId(),
     from,
     message,
     room,
     replyTo,
+    mentions: extractMentions(message),
     createdAt: Date.now(),
   };
   chatMessages.push(msg);
@@ -136,9 +144,20 @@ function broadcastSSE(taskId: string, message: string, sender?: string, to?: str
 
 function broadcastChat(msg: ChatMessage): void {
   const data = JSON.stringify({ type: "chat", ...msg });
+  const hasMentions = msg.mentions.length > 0;
   for (const sub of sseSubscribers) {
-    // Don't echo back to sender
-    if (sub.senderId === msg.from) continue;
+    // Self-dedup: never echo back to sender
+    if (sub.senderId && sub.senderId === msg.from) continue;
+    // Anonymous subscribers: deliver for open rooms, skip ACL-protected
+    if (!sub.senderId) {
+      const roomObj = roomRegistry.get(msg.room);
+      if (roomObj && roomObj.acl.size > 0) continue;
+    } else {
+      // ACL: only deliver to agents with read permission
+      if (!roomRegistry.canRead(msg.room, sub.senderId)) continue;
+      // @mention filter: if mentions exist, only deliver to mentioned agents
+      if (hasMentions && !msg.mentions.includes(sub.senderId.toLowerCase())) continue;
+    }
     try {
       sub.res.write(`data: ${data}\n\n`);
     } catch {
@@ -720,6 +739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const params = new URLSearchParams({
         room: room || "general",
         limit: String(limit || 50),
+        agent: SESSION_NAME,
       });
       const res = await fetch(`${RELAY_URL}/chat?${params}`, {
         headers: authHeaders(),
@@ -1027,8 +1047,17 @@ const httpServer = createServer(async (req, res) => {
       const chatRoom = room || "general";
       const msg = addChatMessage(from, message, chatRoom, reply_to);
 
+      if (!msg) {
+        jsonResponse(res, 403, { error: `Agent "${from}" does not have write access to room "${chatRoom}"` });
+        return;
+      }
+
       // Push to local Claude Code session (if not from self)
-      if (from !== SESSION_NAME) {
+      // Also check ACL + mention filter for local host delivery
+      const hostCanRead = roomRegistry.canRead(chatRoom, SESSION_NAME);
+      const hasMentions = msg.mentions.length > 0;
+      const hostMentioned = !hasMentions || msg.mentions.includes(SESSION_NAME.toLowerCase());
+      if (from !== SESSION_NAME && hostCanRead && hostMentioned) {
         const replyContext = reply_to ? ` (replying to ${reply_to})` : "";
         await server.notification({
           method: "notifications/claude/channel",
@@ -1064,6 +1093,19 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/chat") {
     const room = url.searchParams.get("room") || "general";
     const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+    const agent = url.searchParams.get("agent");
+    // If room has ACL entries, require agent param for history access
+    const roomObj = roomRegistry.get(room);
+    if (roomObj && roomObj.acl.size > 0) {
+      if (!agent) {
+        jsonResponse(res, 400, { error: `Room "${room}" has ACL — "agent" query param is required for history access` });
+        return;
+      }
+      if (!roomRegistry.canAccessHistory(room, agent)) {
+        jsonResponse(res, 403, { error: `Agent "${agent}" does not have history access to room "${room}"` });
+        return;
+      }
+    }
     jsonResponse(res, 200, { room, messages: getChatHistory(room, limit) });
     return;
   }
