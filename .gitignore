@@ -8,3 +8,4 @@ dist/
 .superpowers/
 .mcp.json
 .serendipity_cache.pkl
+.enzyme/
