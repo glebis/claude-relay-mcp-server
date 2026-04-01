@@ -16,7 +16,14 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { z } from "zod";
 import { RoomRegistry, extractMentions, OPEN_PERMISSION } from "./rooms.js";
+import { createDatabase, closeDatabase } from "./store/db.js";
+import { createAuditLogger } from "./store/audit.js";
+import { createTaskStore, type Task } from "./relay/tasks.js";
+import { createChatStore, type ChatMessage } from "./relay/chat.js";
+import { createMachineStore } from "./relay/machines.js";
+import { createPermissionStore, type PermissionRequest } from "./relay/permissions.js";
 
 // ── Configuration ──────────────────────────────────────────────────
 
@@ -25,7 +32,7 @@ const RELAY_BIND = process.env.RELAY_BIND || "0.0.0.0";
 const RELAY_URL = process.env.RELAY_URL || `http://127.0.0.1:${HTTP_PORT}`;
 const RELAY_TOKEN = process.env.RELAY_TOKEN || "";
 const SESSION_NAME = process.env.RELAY_SESSION_NAME || `session-${randomBytes(3).toString("hex")}`;
-const TASK_TTL_MS = parseInt(process.env.RELAY_TASK_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
+const TASK_TTL_HOURS = parseInt(process.env.RELAY_TASK_TTL_HOURS || "8", 10);
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MACHINE_HEARTBEAT_MS = 30 * 1000; // 30 seconds stale threshold
 const RELAY_VERSION = "2.1.0";
@@ -33,69 +40,15 @@ const RELAY_VERSION = "2.1.0";
 const roomRegistry = new RoomRegistry();
 roomRegistry.ensureRoom("general"); // backward compat: always have a "general" room
 
-// ── Task Store ─────────────────────────────────────────────────────
+// ── Domain Stores (initialized in main()) ─────────────────────────
 
-interface Task {
-  id: string;
-  message: string;
-  status: "pending" | "done" | "error" | "awaiting_permission";
-  result?: string;
-  sender?: string;
-  to?: string;
-  createdAt: number;
-  lastAccessed: number;
-  permissionRequest?: PermissionRequest;
-}
+const DB_PATH = process.env.RELAY_DB_PATH || "relay.db";
 
-interface PermissionRequest {
-  requestId: string;
-  toolName: string;
-  description: string;
-  inputPreview: string;
-  receivedAt: number;
-}
-
-const tasks = new Map<string, Task>();
-
-// ── Chat Store ────────────────────────────────────────────────────
-
-interface ChatMessage {
-  id: string;
-  from: string;
-  message: string;
-  room: string;
-  replyTo?: string; // id of message being replied to
-  mentions: string[]; // @mentioned agent names (without @, lowercased)
-  createdAt: number;
-}
-
-const chatMessages: ChatMessage[] = [];
-const MAX_CHAT_HISTORY = 200;
-
-function addChatMessage(from: string, message: string, room: string, replyTo?: string): ChatMessage | null {
-  roomRegistry.ensureRoom(room);
-  if (!roomRegistry.canWrite(room, from)) return null;
-  const msg: ChatMessage = {
-    id: generateId(),
-    from,
-    message,
-    room,
-    replyTo,
-    mentions: extractMentions(message),
-    createdAt: Date.now(),
-  };
-  chatMessages.push(msg);
-  if (chatMessages.length > MAX_CHAT_HISTORY) {
-    chatMessages.splice(0, chatMessages.length - MAX_CHAT_HISTORY);
-  }
-  return msg;
-}
-
-function getChatHistory(room: string, limit = 50): ChatMessage[] {
-  return chatMessages
-    .filter((m) => m.room === room)
-    .slice(-limit);
-}
+let taskStore: ReturnType<typeof createTaskStore>;
+let chatStore: ReturnType<typeof createChatStore>;
+let machineStore: ReturnType<typeof createMachineStore>;
+let permissionStore: ReturnType<typeof createPermissionStore>;
+let audit: ReturnType<typeof createAuditLogger>;
 
 // ── SSE Subscribers ───────────────────────────────────────────────
 
@@ -128,7 +81,7 @@ function broadcastToObservers(event: {
   }
 }
 
-function broadcastSSE(taskId: string, message: string, sender?: string, to?: string): void {
+function broadcastSSE(taskId: string, message: string, sender?: string | null, to?: string | null): void {
   const data = JSON.stringify({ task_id: taskId, message, sender, to });
   for (const sub of sseSubscribers) {
     // Don't echo back to sender
@@ -143,7 +96,7 @@ function broadcastSSE(taskId: string, message: string, sender?: string, to?: str
   }
 }
 
-function broadcastChat(msg: ChatMessage): void {
+function broadcastChat(msg: ChatMessage & { mentions: string[] }): void {
   const data = JSON.stringify({ type: "chat", ...msg });
   const hasMentions = msg.mentions.length > 0;
   for (const sub of sseSubscribers) {
@@ -167,25 +120,6 @@ function broadcastChat(msg: ChatMessage): void {
   }
 }
 
-function generateId(): string {
-  return randomBytes(6).toString("hex");
-}
-
-function cleanupExpiredTasks(): void {
-  const now = Date.now();
-  for (const [id, task] of tasks) {
-    // Use lastAccessed for TTL — polling extends lifetime
-    const age = now - task.lastAccessed;
-    if (age > TASK_TTL_MS) {
-      console.error(`claude-relay: task ${id} expired (age: ${Math.round(age / 60000)}min)`);
-      tasks.delete(id);
-    }
-  }
-}
-
-// Periodic cleanup
-setInterval(cleanupExpiredTasks, CLEANUP_INTERVAL_MS);
-
 // ── Auth ──────────────────────────────────────────────────────────
 
 function checkAuth(req: IncomingMessage, res: ServerResponse): boolean {
@@ -204,32 +138,6 @@ function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (RELAY_TOKEN) headers["Authorization"] = `Bearer ${RELAY_TOKEN}`;
   return headers;
-}
-
-// ── Machine Registry ──────────────────────────────────────────────
-
-interface Machine {
-  name: string;
-  lastSeen: number;
-  mode: "host" | "client";
-  ip?: string;
-  version?: string;
-}
-
-const machines = new Map<string, Machine>();
-
-function registerMachine(name: string, mode: "host" | "client", ip?: string, version?: string): void {
-  const existing = machines.get(name);
-  machines.set(name, { name, lastSeen: Date.now(), mode, ip, version: version || existing?.version });
-}
-
-function getMachineList(): Array<Machine & { online: boolean }> {
-  const now = Date.now();
-  return Array.from(machines.values()).map((m) => ({
-    ...m,
-    online: now - m.lastSeen < MACHINE_HEARTBEAT_MS * 3,
-    lastSeen: m.lastSeen,
-  }));
 }
 
 // ── MCP Server ─────────────────────────────────────────────────────
@@ -256,30 +164,12 @@ const server = new Server(
 
 // ── Permission Request Handler ─────────────────────────────────────
 
-// Track pending permission requests (keyed by request_id)
-const pendingPermissions = new Map<string, {
-  requestId: string;
-  toolName: string;
-  description: string;
-  inputPreview: string;
-  receivedAt: number;
-  taskId?: string; // link to the task that triggered it
-}>();
-
 // Find the most recently created pending task — likely the one waiting for permission
 function findActiveTask(): Task | undefined {
-  let latest: Task | undefined;
-  for (const task of tasks.values()) {
-    if (task.status === "pending" && (!latest || task.createdAt > latest.createdAt)) {
-      latest = task;
-    }
-  }
-  return latest;
+  const pending = taskStore.listByStatus("pending");
+  if (pending.length === 0) return undefined;
+  return pending[0]; // already sorted by created_at DESC
 }
-
-// Listen for permission_request notifications from Claude Code
-// The SDK schema for this is experimental, so we use a custom Zod-like approach
-import { z } from "zod";
 
 const PermissionRequestNotificationSchema = z.object({
   method: z.literal("notifications/claude/channel/permission_request"),
@@ -294,7 +184,7 @@ const PermissionRequestNotificationSchema = z.object({
 server.setNotificationHandler(PermissionRequestNotificationSchema, async ({ params }) => {
   const activeTask = findActiveTask();
 
-  const permReq = {
+  const permReq: PermissionRequest = {
     requestId: params.request_id,
     toolName: params.tool_name,
     description: params.description,
@@ -303,19 +193,18 @@ server.setNotificationHandler(PermissionRequestNotificationSchema, async ({ para
     taskId: activeTask?.id,
   };
 
-  pendingPermissions.set(params.request_id, permReq);
+  permissionStore.add(permReq);
 
   // Update the task status to awaiting_permission
   if (activeTask) {
-    activeTask.status = "awaiting_permission";
-    activeTask.permissionRequest = {
-      requestId: params.request_id,
-      toolName: params.tool_name,
-      description: params.description,
-      inputPreview: params.input_preview,
-      receivedAt: Date.now(),
-    };
+    try {
+      taskStore.updateStatus(activeTask.id, "awaiting_permission", activeTask.version);
+    } catch (err) {
+      console.error(`claude-relay: failed to update task status to awaiting_permission: ${err}`);
+    }
   }
+
+  audit.log({ taskId: activeTask?.id, actor: "system", action: "permission_requested", payload: { tool: params.tool_name, request_id: params.request_id } });
 
   console.error(
     `claude-relay: permission requested — ${params.tool_name}: ${params.description} (id: ${params.request_id}, task: ${activeTask?.id || "unknown"})`
@@ -759,7 +648,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "relay_respond_permission") {
     const { request_id, allow } = args as { request_id: string; allow: boolean };
 
-    const perm = pendingPermissions.get(request_id);
+    const perm = permissionStore.get(request_id);
     if (!perm) {
       // Try sending via HTTP to the host (in case we're a client)
       try {
@@ -797,14 +686,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     // Update task status back to pending
     if (perm.taskId) {
-      const task = tasks.get(perm.taskId);
+      const task = taskStore.get(perm.taskId);
       if (task) {
-        task.status = "pending";
-        task.permissionRequest = undefined;
+        try {
+          taskStore.updateStatus(perm.taskId, "pending", task.version);
+        } catch (err) {
+          console.error(`claude-relay: failed to restore task status to pending: ${err}`);
+        }
       }
     }
 
-    pendingPermissions.delete(request_id);
+    permissionStore.remove(request_id);
+    audit.log({ taskId: perm.taskId, actor: "system", action: allow ? "permission_granted" : "permission_denied", payload: { tool: perm.toolName, request_id } });
     console.error(`claude-relay: permission ${allow ? "granted" : "denied"} for ${perm.toolName} (${request_id})`);
 
     return {
@@ -973,7 +866,7 @@ const httpServer = createServer(async (req, res) => {
       name: "claude-relay",
       version: RELAY_VERSION,
       session_name: SESSION_NAME,
-      tasks_count: tasks.size,
+      tasks_count: taskStore ? taskStore.listAll().length : 0,
       sse_subscribers: sseSubscribers.size,
       rooms_count: roomRegistry.list().length,
       auth_required: !!RELAY_TOKEN,
@@ -1007,18 +900,8 @@ const httpServer = createServer(async (req, res) => {
         return;
       }
 
-      const id = generateId();
-      const now = Date.now();
-      const task: Task = {
-        id,
-        message,
-        sender,
-        to,
-        status: "pending",
-        createdAt: now,
-        lastAccessed: now,
-      };
-      tasks.set(id, task);
+      const task = taskStore.create({ message, sender, to });
+      audit.log({ taskId: task.id, actor: sender || "system", action: "created", payload: { to } });
 
       // Push notification to the local Claude Code session (host mode)
       // Only if: (a) no "to" or "to" matches host, AND (b) sender is NOT the host
@@ -1030,7 +913,7 @@ const httpServer = createServer(async (req, res) => {
           params: {
             content: message,
             meta: {
-              task_id: id,
+              task_id: task.id,
               ...(sender ? { sender } : {}),
             },
           },
@@ -1038,18 +921,18 @@ const httpServer = createServer(async (req, res) => {
       }
 
       // Broadcast to SSE subscribers (filtered by "to" if specified)
-      broadcastSSE(id, message, sender, to);
+      broadcastSSE(task.id, message, sender, to);
 
       // Notify observers
       broadcastToObservers({
         type: "task_created",
-        id,
+        id: task.id,
         message,
         sender,
         to,
       });
 
-      jsonResponse(res, 201, { id, status: "pending" });
+      jsonResponse(res, 201, { id: task.id, status: "pending" });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error("POST /task error:", errorMessage);
@@ -1064,13 +947,15 @@ const httpServer = createServer(async (req, res) => {
     try {
       const body = await readBody(req);
       const { result, status } = JSON.parse(body) as { result: string; status: string };
-      const task = tasks.get(taskPutMatch[1]);
+      const task = taskStore.get(taskPutMatch[1]);
       if (!task) {
         jsonResponse(res, 404, { error: "Task not found or expired" });
         return;
       }
-      task.status = (status as "done" | "error") || "done";
-      task.result = result;
+
+      const finalStatus = (status as "done" | "error") || "done";
+      const updated = taskStore.complete(task.id, finalStatus, result, task.version);
+      audit.log({ taskId: task.id, actor: task.sender || "unknown", action: "completed", payload: { status: finalStatus } });
 
       // Push completion notification ONLY to the original sender
       const completionMsg = `Task ${task.id} completed: ${result}`;
@@ -1100,13 +985,13 @@ const httpServer = createServer(async (req, res) => {
       broadcastToObservers({
         type: "task_completed",
         id: task.id,
-        status: task.status,
-        result: task.result,
+        status: updated.status,
+        result: updated.result,
         sender: task.sender,
         originalMessage: task.message,
       });
 
-      jsonResponse(res, 200, { id: task.id, status: task.status });
+      jsonResponse(res, 200, { id: task.id, status: updated.status });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       jsonResponse(res, 500, { error: errorMessage });
@@ -1117,24 +1002,24 @@ const httpServer = createServer(async (req, res) => {
   // GET /task/:id — check task status and retrieve result
   const taskMatch = url.pathname.match(/^\/task\/([a-f0-9]+)$/);
   if (req.method === "GET" && taskMatch) {
-    const task = tasks.get(taskMatch[1]);
+    const task = taskStore.get(taskMatch[1]);
     if (!task) {
       jsonResponse(res, 404, { error: "Task not found or expired" });
       return;
     }
-    // Auto-extend TTL on access
-    task.lastAccessed = Date.now();
+    // Look up any pending permission request for this task
+    const permReq = permissionStore.findByTask(task.id);
     jsonResponse(res, 200, {
       id: task.id,
       status: task.status,
       message: task.message,
       result: task.result || null,
-      ...(task.permissionRequest ? {
+      ...(permReq ? {
         permission_request: {
-          request_id: task.permissionRequest.requestId,
-          tool_name: task.permissionRequest.toolName,
-          description: task.permissionRequest.description,
-          input_preview: task.permissionRequest.inputPreview,
+          request_id: permReq.requestId,
+          tool_name: permReq.toolName,
+          description: permReq.description,
+          input_preview: permReq.inputPreview,
         },
       } : {}),
     });
@@ -1143,11 +1028,11 @@ const httpServer = createServer(async (req, res) => {
 
   // GET /tasks — list all tasks (for debugging)
   if (req.method === "GET" && url.pathname === "/tasks") {
-    const list = Array.from(tasks.values()).map((t) => ({
+    const list = taskStore.listAll().map((t) => ({
       id: t.id,
       status: t.status,
       message: t.message.slice(0, 100),
-      createdAt: new Date(t.createdAt).toISOString(),
+      createdAt: new Date(t.created_at).toISOString(),
     }));
     jsonResponse(res, 200, { tasks: list });
     return;
@@ -1166,7 +1051,7 @@ const httpServer = createServer(async (req, res) => {
     res.write(":ok\n\n");
 
     if (senderId) {
-      registerMachine(senderId, "client", clientIp, clientVersion);
+      machineStore.register(senderId, "client", clientIp);
     }
 
     const subscriber: SSESubscriber = { res, senderId };
@@ -1177,7 +1062,7 @@ const httpServer = createServer(async (req, res) => {
     const heartbeat = setInterval(() => {
       try {
         res.write(":heartbeat\n\n");
-        if (senderId) registerMachine(senderId, "client", clientIp);
+        if (senderId) machineStore.register(senderId, "client", clientIp);
       } catch {
         clearInterval(heartbeat);
       }
@@ -1193,7 +1078,7 @@ const httpServer = createServer(async (req, res) => {
 
   // GET /machines — list registered machines
   if (req.method === "GET" && url.pathname === "/machines") {
-    jsonResponse(res, 200, { machines: getMachineList() });
+    jsonResponse(res, 200, { machines: machineStore.list() });
     return;
   }
 
@@ -1214,18 +1099,21 @@ const httpServer = createServer(async (req, res) => {
       }
 
       const chatRoom = room || "general";
-      const msg = addChatMessage(from, message, chatRoom, reply_to);
+      roomRegistry.ensureRoom(chatRoom);
 
-      if (!msg) {
+      if (!roomRegistry.canWrite(chatRoom, from)) {
         jsonResponse(res, 403, { error: `Agent "${from}" does not have write access to room "${chatRoom}"` });
         return;
       }
 
+      const msg = chatStore.add(from, message, chatRoom, reply_to);
+      const mentions = extractMentions(message);
+
       // Push to local Claude Code session (if not from self)
       // Also check ACL + mention filter for local host delivery
       const hostCanRead = roomRegistry.canRead(chatRoom, SESSION_NAME);
-      const hasMentions = msg.mentions.length > 0;
-      const hostMentioned = !hasMentions || msg.mentions.includes(SESSION_NAME.toLowerCase());
+      const hasMentions = mentions.length > 0;
+      const hostMentioned = !hasMentions || mentions.includes(SESSION_NAME.toLowerCase());
       if (from !== SESSION_NAME && hostCanRead && hostMentioned) {
         const replyContext = reply_to ? ` (replying to ${reply_to})` : "";
         await server.notification({
@@ -1237,8 +1125,8 @@ const httpServer = createServer(async (req, res) => {
         });
       }
 
-      // Broadcast to SSE subscribers
-      broadcastChat(msg);
+      // Broadcast to SSE subscribers (with mentions for filtering)
+      broadcastChat({ ...msg, mentions });
 
       // Notify observers
       broadcastToObservers({
@@ -1275,7 +1163,7 @@ const httpServer = createServer(async (req, res) => {
         return;
       }
     }
-    jsonResponse(res, 200, { room, messages: getChatHistory(room, limit) });
+    jsonResponse(res, 200, { room, messages: chatStore.getHistory(room, limit) });
     return;
   }
 
@@ -1285,7 +1173,7 @@ const httpServer = createServer(async (req, res) => {
       const body = await readBody(req);
       const { request_id, allow } = JSON.parse(body) as { request_id: string; allow: boolean };
 
-      const perm = pendingPermissions.get(request_id);
+      const perm = permissionStore.get(request_id);
       if (!perm) {
         jsonResponse(res, 404, { error: `Permission request "${request_id}" not found` });
         return;
@@ -1300,14 +1188,18 @@ const httpServer = createServer(async (req, res) => {
       });
 
       if (perm.taskId) {
-        const task = tasks.get(perm.taskId);
+        const task = taskStore.get(perm.taskId);
         if (task) {
-          task.status = "pending";
-          task.permissionRequest = undefined;
+          try {
+            taskStore.updateStatus(perm.taskId, "pending", task.version);
+          } catch (err) {
+            console.error(`claude-relay: failed to restore task status to pending: ${err}`);
+          }
         }
       }
 
-      pendingPermissions.delete(request_id);
+      permissionStore.remove(request_id);
+      audit.log({ taskId: perm.taskId, actor: "system", action: allow ? "permission_granted" : "permission_denied", payload: { tool: perm.toolName, request_id } });
       console.error(`claude-relay: permission ${allow ? "granted" : "denied"} for ${perm.toolName} (${request_id}) via HTTP`);
 
       jsonResponse(res, 200, { ok: true });
@@ -1320,7 +1212,7 @@ const httpServer = createServer(async (req, res) => {
 
   // GET /permissions — list pending permission requests
   if (req.method === "GET" && url.pathname === "/permissions") {
-    const list = Array.from(pendingPermissions.values()).map((p) => ({
+    const list = permissionStore.list().map((p) => ({
       request_id: p.requestId,
       tool_name: p.toolName,
       description: p.description,
@@ -1355,25 +1247,24 @@ const httpServer = createServer(async (req, res) => {
 
   // GET /history — full event history across all rooms and tasks (for initial load)
   if (req.method === "GET" && url.pathname === "/history") {
-    const allChats = chatMessages.map((m) => ({
+    const allChats = chatStore.getHistory("general", 200).map((m) => ({
       type: "chat" as const,
       ...m,
-      timestamp: m.createdAt,
+      timestamp: m.created_at,
     }));
-    const allTasks = Array.from(tasks.values()).map((t) => ({
+    const allTaskRows = taskStore.listAll();
+    const allTasks = allTaskRows.map((t) => ({
       type: t.status === "pending" ? "task_created" as const : "task_completed" as const,
       id: t.id,
       message: t.message,
       sender: t.sender,
-      to: t.to,
-      result: t.result,
       status: t.status,
-      timestamp: t.createdAt,
+      timestamp: t.created_at,
     }));
     const all = [...allChats, ...allTasks].sort((a, b) => a.timestamp - b.timestamp);
     jsonResponse(res, 200, {
       events: all,
-      machines: getMachineList(),
+      machines: machineStore.list(),
       rooms: roomRegistry.list().map((r) => roomRegistry.serialize(r)),
     });
     return;
@@ -1383,9 +1274,9 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/machines/heartbeat") {
     try {
       const body = await readBody(req);
-      const { name, version } = JSON.parse(body) as { name: string; version?: string };
+      const { name } = JSON.parse(body) as { name: string; version?: string };
       const clientIp = req.socket.remoteAddress;
-      registerMachine(name, "client", clientIp, version);
+      machineStore.register(name, "client", clientIp);
       jsonResponse(res, 200, { ok: true });
     } catch {
       jsonResponse(res, 400, { error: "Invalid heartbeat payload" });
@@ -1484,8 +1375,6 @@ const httpServer = createServer(async (req, res) => {
 
   jsonResponse(res, 404, { error: "Not found" });
 });
-
-// ── Startup ────────────────────────────────────────────────────────
 
 // ── SSE Client (for client-only mode) ─────────────────────────────
 
@@ -1586,7 +1475,34 @@ function subscribeToSSE(): void {
   });
 }
 
+// ── Startup ────────────────────────────────────────────────────────
+
 async function main(): Promise<void> {
+  // Initialize SQLite and domain stores
+  const db = createDatabase(DB_PATH);
+  taskStore = createTaskStore(db);
+  chatStore = createChatStore(db);
+  machineStore = createMachineStore(db);
+  permissionStore = createPermissionStore();
+  audit = createAuditLogger(db);
+
+  // Periodic cleanup of expired tasks
+  setInterval(() => {
+    const deleted = taskStore.cleanup(TASK_TTL_HOURS);
+    if (deleted > 0) {
+      console.error(`claude-relay: cleaned up ${deleted} expired tasks`);
+    }
+  }, CLEANUP_INTERVAL_MS);
+
+  // Graceful shutdown
+  const shutdown = () => {
+    console.error("claude-relay: shutting down...");
+    closeDatabase(db);
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
   let isHost = false;
 
   // Start HTTP server (graceful if port already taken by another instance)
@@ -1610,7 +1526,7 @@ async function main(): Promise<void> {
         console.error("claude-relay: token auth DISABLED (set RELAY_TOKEN to enable)");
       }
       isHost = true;
-      registerMachine(SESSION_NAME, "host", RELAY_BIND, RELAY_VERSION);
+      machineStore.register(SESSION_NAME, "host", RELAY_BIND);
       resolve();
     });
   });
