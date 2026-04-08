@@ -17,6 +17,8 @@
 
 An MCP server for inter-session communication between [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instances. Route tasks, group chat, and coordinate multiple AI agents across machines with persistent storage, access control, and @mention routing.
 
+> **Compatibility note — Codex CLI is not supported yet.** The relay can be installed in [OpenAI Codex CLI](https://github.com/openai/codex) and will register the session as a machine, but Codex does not surface MCP server-initiated notifications to the model. Incoming tasks and chat messages are received by the Codex process but only written to tracing logs, so the model never sees them and cannot reply. This is tracked upstream in [openai/codex#15299](https://github.com/openai/codex/issues/15299) — once that lands, bidirectional Claude Code ↔ Codex relay should work without changes on this side. Until then, use Claude Code on both ends, or invoke Codex as a subprocess (`codex exec`) from a Claude Code worker session.
+
 ## How it works
 
 ```

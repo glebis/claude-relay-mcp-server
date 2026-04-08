@@ -16,6 +16,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { readFileSync, existsSync, writeFileSync, chmodSync } from "node:fs";
+import { homedir as _homedir } from "node:os";
+import { join as _join } from "node:path";
 import { z } from "zod";
 import { RoomRegistry, extractMentions, OPEN_PERMISSION } from "./rooms.js";
 import { createDatabase, closeDatabase } from "./store/db.js";
@@ -30,9 +33,28 @@ import { createPermissionStore, type PermissionRequest } from "./relay/permissio
 const HTTP_PORT = parseInt(process.env.RELAY_PORT || "8788", 10);
 const RELAY_BIND = process.env.RELAY_BIND || "0.0.0.0";
 const RELAY_URL = process.env.RELAY_URL || `http://127.0.0.1:${HTTP_PORT}`;
-const RELAY_TOKEN = process.env.RELAY_TOKEN || "";
+const TOKEN_FILE = process.env.RELAY_TOKEN_FILE || _join(_homedir(), ".claude", "relay-token");
+function loadOrCreateToken(): string {
+  if (process.env.RELAY_TOKEN) return process.env.RELAY_TOKEN;
+  if (existsSync(TOKEN_FILE)) {
+    const t = readFileSync(TOKEN_FILE, "utf8").trim();
+    if (t) return t;
+  }
+  const t = randomBytes(32).toString("hex");
+  try {
+    mkdirSync(dirname(TOKEN_FILE), { recursive: true });
+    writeFileSync(TOKEN_FILE, t + "\n");
+    chmodSync(TOKEN_FILE, 0o600);
+    console.error(`claude-relay: generated new shared token at ${TOKEN_FILE}`);
+  } catch (e) {
+    console.error(`claude-relay: failed to persist token to ${TOKEN_FILE}:`, e);
+  }
+  return t;
+}
+const RELAY_TOKEN = loadOrCreateToken();
 const SESSION_NAME = process.env.RELAY_SESSION_NAME || `session-${randomBytes(3).toString("hex")}`;
 const TASK_TTL_HOURS = parseInt(process.env.RELAY_TASK_TTL_HOURS || "8", 10);
+const MACHINE_TTL_MS = parseInt(process.env.RELAY_MACHINE_TTL_MINUTES || "60", 10) * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MACHINE_HEARTBEAT_MS = 30 * 1000; // 30 seconds stale threshold
 const RELAY_VERSION = "2.1.0";
@@ -42,7 +64,13 @@ roomRegistry.ensureRoom("general"); // backward compat: always have a "general" 
 
 // ── Domain Stores (initialized in main()) ─────────────────────────
 
-const DB_PATH = process.env.RELAY_DB_PATH || "relay.db";
+import { homedir } from "node:os";
+import { mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+
+const DEFAULT_DB_PATH = join(homedir(), ".claude", "relay.db");
+const DB_PATH = process.env.RELAY_DB_PATH || DEFAULT_DB_PATH;
+mkdirSync(dirname(DB_PATH), { recursive: true });
 
 let taskStore: ReturnType<typeof createTaskStore>;
 let chatStore: ReturnType<typeof createChatStore>;
@@ -1537,6 +1565,10 @@ async function main(): Promise<void> {
     const deleted = taskStore.cleanup(TASK_TTL_HOURS);
     if (deleted > 0) {
       console.error(`claude-relay: cleaned up ${deleted} expired tasks`);
+    }
+    const prunedMachines = machineStore.pruneStale(MACHINE_TTL_MS);
+    if (prunedMachines > 0) {
+      console.error(`claude-relay: pruned ${prunedMachines} stale machines`);
     }
   }, CLEANUP_INTERVAL_MS);
 

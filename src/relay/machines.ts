@@ -33,6 +33,7 @@ export function createMachineStore(db: Database.Database) {
     resetFailures: db.prepare(`
       UPDATE machines SET consecutive_failures = 0, status = 'online' WHERE name = ?
     `),
+    pruneStale: db.prepare(`DELETE FROM machines WHERE last_seen < ?`),
   };
 
   return {
@@ -55,6 +56,12 @@ export function createMachineStore(db: Database.Database) {
 
     recordSuccess(name: string): void {
       stmts.resetFailures.run(name);
+    },
+
+    pruneStale(maxAgeMs: number): number {
+      const cutoff = Date.now() - maxAgeMs;
+      const res = stmts.pruneStale.run(cutoff);
+      return res.changes as number;
     },
   };
 }
